@@ -17,4 +17,3 @@ This project focuses on scene change detection using PyTorch. The goal is to det
 - Repository initialized
 - Project structure created
 - Dataset research started
-- Environment setup completed
