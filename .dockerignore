@@ -1,0 +1,28 @@
+.git
+.gitignore
+.claude
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+venv/
+.venv/
+env/
+
+.vscode/
+.idea/
+
+# Dataset is mounted at runtime, not baked into the image.
+data/
+
+# Generated artifacts (checkpoints are kept so the image ships a usable model).
+outputs/logs/
+outputs/predictions/
+
+# Exploratory scripts and docs are not needed at runtime.
+tests/first/
+*.md
+Dockerfile
+.dockerignore

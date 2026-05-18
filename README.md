@@ -1,202 +1,256 @@
-# Scene Change Detection
+# Scene Change Detection (SCD)
 
-## Problem
-This project focuses on scene change detection using PyTorch. The goal is to detect and localize changed regions between two input images and, if possible, identify change categories.
+Detect and localize the changes between two images of the same scene
+(a "before" image **A** and an "after" image **B**) and produce a binary
+change mask. The project is implemented in **Python + PyTorch** and the
+post-training inference workflow runs inside **Docker**.
 
 ## Task Requirements
-- Data preprocessing
-- Custom dataloader
-- Model design
-- Training and inference
-- Loss logging
-- Visualization on 2 sample images or videos
-- Dockerized post-training workflow
-- Documentation and setup files
 
-## Dataset Structure
+| Requirement | Status | Where |
+|---|---|---|
+| Data preprocessing + custom data loader | Done | `src/datasets/scd_dataset.py` |
+| Model architecture | Done | `src/models/` (3 models) |
+| Training + inference from the trained model | Done | `src/training/train.py`, `src/inference/predict.py` |
+| Loss logging during training | Done | CSV (`metrics.csv`) + TensorBoard |
+| Change visualization on selected images | Done | `src/inference/predict.py` |
+| Dockerized post-training workflow | Done | `Dockerfile`, `.dockerignore` |
+| Tests, requirements, documentation | Done | `tests/`, `requirements.txt`, this file |
 
+## Project Structure
+
+```
+scene-change-detection/
+├── Dockerfile              # Container for the inference workflow
+├── .dockerignore
+├── requirements.txt        # Python dependencies
+├── conftest.py             # Makes the project importable for pytest
+├── README.md
+├── data/
+│   └── raw/building-change/{train,val}/{A,B,label}/   # dataset (not in git)
+├── outputs/
+│   ├── checkpoints/        # trained weights (not in git)
+│   ├── logs/               # TensorBoard events + metrics.csv (not in git)
+│   └── predictions/        # saved visualizations (not in git)
+├── src/
+│   ├── datasets/scd_dataset.py        # custom Dataset
+│   ├── models/
+│   │   ├── simple_model.py            # baseline (6-channel input)
+│   │   ├── siamese_model.py           # shared-encoder baseline
+│   │   └── siamese_unet_model.py      # final model
+│   ├── training/train.py              # training loop + loss logging
+│   ├── inference/predict.py           # inference + change visualization
+│   └── utils/losses.py                # BCE + Dice loss
+└── tests/                  # pytest test suite
+```
+
+`data/` and `outputs/` are git-ignored; they are mounted into the container
+at runtime (see [Docker](#docker)).
+
+## Dataset
+
+The model is trained on a building change-detection dataset organized as:
+
+```
 data/raw/building-change/
 ├── train/
-│   ├── A/
-│   ├── B/
-│   └── label/
+│   ├── A/        # before images
+│   ├── B/        # after images
+│   └── label/    # binary change masks
 └── val/
     ├── A/
     ├── B/
     └── label/
+```
 
-Each sample consists of:
-- A: before image
-- B: after image
-- label: binary change mask
-
-Train split statistics:
-- Empty masks (no change): 642
-- Non-empty masks (change): 2026
-
-The dataset structure was verified manually and visually.
-
-### Data Characteristics
-
-- Image size: 512x512
-- Mask values: 0 (no change), 255 (change)
-- Converted to: 0 and 1 during preprocessing
+- Image size: `512 x 512`, RGB.
+- Each `A`/`B`/`label` triplet shares the same file name.
+- Mask values on disk: `0` (no change) and `255` (change).
+- Train split: 2026 samples with change, 642 with no change (class imbalance).
 
 ## Data Pipeline
 
-### Preprocessing
+`SCDDataset` (`src/datasets/scd_dataset.py`) is a custom `torch.utils.data.Dataset` that:
 
-- Images converted from BGR to RGB
-- Pixel values normalized to [0, 1]
-- Masks converted from 0/255 to 0/1
+- reads the `A`, `B` and `label` images,
+- converts images from BGR to RGB and normalizes pixels to `[0, 1]`,
+- converts masks from `{0, 255}` to `{0, 1}`,
+- returns CHW tensors: `image_a [3,H,W]`, `image_b [3,H,W]`, `mask [1,H,W]`.
 
-### Custom Dataset
-
-A PyTorch Dataset class was implemented to:
-- Load paired images (A and B)
-- Load corresponding masks
-- Convert all inputs to tensors
-- Return data in the format:
-  - image_a: [3, H, W]
-  - image_b: [3, H, W]
-  - mask: [1, H, W]
-
-### DataLoader
-
-- Batch size: 4 (CPU training)
-- Shuffle enabled for training
-- num_workers used for parallel data loading
-
-### Visualization
-
-Sample inputs and masks were visualized to verify:
-- correct pairing of A and B
-- correct mask alignment
-- proper normalization
+It is consumed by a standard `DataLoader` (batching, shuffling for training).
 
 ## Models
 
-Two different model architectures were implemented and compared.
+Three architectures were implemented; complexity was increased step by step.
 
-### 1. Baseline Model (6-Channel Input)
+### 1. `SimpleChangeNet` — baseline
+A and B are concatenated along the channel axis (`[6,H,W]`) and passed
+through a small encoder–decoder CNN. Useful to validate the full pipeline.
 
-In this approach:
-- Image A and Image B are concatenated along the channel dimension
-- Input shape becomes [6, H, W]
+### 2. `SiameseChangeNet` — shared-encoder baseline
+A and B are encoded separately by a **shared** encoder; the absolute
+difference of the feature maps is decoded into a change mask. This compares
+the two images explicitly instead of relying on the network to learn the
+comparison from concatenated channels.
 
-Architecture:
-- Simple encoder-decoder CNN
-- Convolution + ReLU + MaxPool in encoder
-- Transposed convolution in decoder
-- Output: single-channel change mask
+### 3. `SiameseUNet` — final model
+A U-Net with a Siamese encoder:
 
-### 2. Siamese Model
+- a **shared encoder** extracts multi-scale features from A and B
+  (3 downsampling stages + a bottleneck, with `BatchNorm`),
+- the **absolute difference** of A/B features is computed at every scale,
+- a **U-Net decoder** upsamples the bottleneck difference and fuses the
+  per-scale differences through **skip connections**, restoring full
+  spatial resolution.
 
-In this approach:
-- Image A and Image B are processed separately using a shared encoder
-- The same weights are used for both inputs
-
-Steps:
-1. Extract features from A and B using a shared encoder
-2. Compute absolute difference between feature maps
-3. Pass the difference through a decoder to produce change mask
-
-This design is more suitable for change detection as it explicitly compares features from both images.
+The skip connections preserve fine spatial detail, which clearly improves
+the sharpness and accuracy of the predicted mask. **`SiameseUNet` is the
+final model** (~1.93M parameters); its weights are
+`outputs/checkpoints/best_siamese_unet_model.pth`.
 
 ## Loss Function
 
-Due to class imbalance and sparse change regions, a combination of Binary Cross Entropy and Dice Loss was used to ensure both pixel-wise accuracy and region-level overlap.
+Because the change regions are sparse and the classes are imbalanced, the
+training loss combines two terms (`src/utils/losses.py`):
 
-### Binary Cross Entropy (BCEWithLogitsLoss)
-- Handles pixel-wise classification
+- **`BCEWithLogitsLoss`** — pixel-wise classification.
+- **Dice loss** — region overlap; robust to class imbalance.
 
-### Dice Loss
-- Improves performance on imbalanced data
-- Focuses on overlap between predicted and ground truth masks
+`combined_loss = BCE + Dice`.
 
-## Training Setup
+## Training
 
-- Optimizer: Adam
-- Learning rate: 1e-3
-- Batch size: 4
-- Device: CPU (optionally GPU in Colab)
-- Epochs tested: up to 6
+```bash
+python src/training/train.py --model siamese_unet
+```
 
-## Training Results
+- Optimizer: Adam, learning rate `1e-3`.
+- Batch size: 4. Default: 6 epochs.
+- The best checkpoint (lowest validation loss) is saved to
+  `outputs/checkpoints/best_<model>_model.pth`.
+- **Loss logging:** the per-epoch train/validation loss is written to
+  `outputs/logs/<model>/metrics.csv` and, when the package is available,
+  streamed to **TensorBoard** in the same directory.
 
-### Baseline Model (6 epochs)
+Useful options: `--model {simple,siamese,siamese_unet}`, `--epochs`,
+`--batch-size`, `--lr`, `--data-root`, `--output-dir`.
 
-| Epoch | Train Loss | Val Loss |
-|------|----------|---------|
-| 1 | 1.1336 | 1.0637 |
-| 2 | 1.0398 | 0.9596 |
-| 3 | 0.9241 | 0.9304 |
-| 4 | 0.8385 | 0.7970 |
-| 5 | 0.7903 | **0.7924** |
-| 6 | 0.7577 | 0.8543 |
+View the TensorBoard curves:
 
-Best validation loss: 0.7924 (Epoch 5)
+```bash
+tensorboard --logdir outputs/logs
+```
 
-### Siamese Model (6 epochs)
+### Baseline experiments
 
-| Epoch | Train Loss | Val Loss |
-|------|----------|---------|
-| 1 | 1.1390 | 1.0385 |
-| 2 | 0.9609 | 0.9542 |
-| 3 | 0.8255 | 0.8579 |
-| 4 | 0.7464 | 0.7873 |
-| 5 | 0.7984 | **0.7481** |
-| 6 | 0.6683 | 0.8119 |
+The two earlier baselines were trained for 6 epochs under identical
+settings. Their recorded validation loss:
 
-Best validation loss: 0.7481 (Epoch 5)
+| Model | Best val loss (epoch 5) |
+|---|---|
+| `SimpleChangeNet` | 0.7924 |
+| `SiameseChangeNet` | 0.7481 |
 
-## Model Comparison
+Both baselines started to overfit after epoch 5. The Siamese design
+outperformed the concatenation baseline, which motivated the final
+`SiameseUNet` with skip connections. On the sample validation pairs,
+`SiameseUNet` reaches an IoU/F1 far above the plain Siamese model
+(see the numbers printed by the inference script below).
 
-Both models were trained under the same conditions (same dataset, loss, optimizer, and number of epochs).
+## Inference and Change Visualization
 
-Results:
+`src/inference/predict.py` loads a trained model, runs it on image pairs,
+and produces an interpretable visualization of the detected changes.
 
-- Baseline best validation loss: 0.7924
-- Siamese best validation loss: 0.7481
+Default run — picks 2 sample pairs from the validation set:
 
-Conclusion:
+```bash
+python src/inference/predict.py
+```
 
-The Siamese model achieved better performance and was selected as the final model.
+Run on a specific image pair:
 
-Both models showed increased validation loss after epoch 5, indicating the start of overfitting. Therefore, the checkpoint from epoch 5 was used as the final model.
+```bash
+python src/inference/predict.py --image-a path/to/A.png --image-b path/to/B.png
+```
 
-## Final Model
+For each pair the script:
 
-Selected model:
-- Siamese Change Detection Network
+- predicts a change probability map and thresholds it into a binary mask,
+- **interprets** the result: number of changed pixels and their percentage,
+  number of distinct change regions (connected components), and — when a
+  ground-truth mask is available — the **IoU** and **F1** score,
+- saves a side-by-side figure to `outputs/predictions/prediction_<name>.png`
+  showing *Image A*, *Image B*, the ground truth (if any), the predicted
+  change mask, and the changes highlighted **in red** over image B.
 
-Best checkpoint:
+Options: `--model`, `--checkpoint`, `--threshold`, `--num-samples`,
+`--split`, `--data-root`, `--output-dir`.
 
-outputs/checkpoints/best_model.pth
+## Docker
 
-## Key Learnings
+The post-training workflow (inference + visualization) is containerized.
 
-- A simple baseline model is useful to validate the full pipeline before using more complex architectures
-- Siamese networks are more suitable for change detection tasks
-- Increasing the number of epochs improves performance up to a point
-- Validation loss is critical for detecting overfitting
-- The best model is not the last epoch, but the one with the lowest validation loss
+Build the image (run from the project root, so the trained checkpoints are
+included in the build context):
 
-## Next Steps
+```bash
+docker build -t scd .
+```
 
-- Visualize model predictions
-- Evaluate with additional metrics (IoU, F1-score)
-- Improve architecture (e.g., U-Net, skip connections)
-- Train on GPU for faster experimentation
+Run inference — mount the dataset and the outputs directory so the
+visualizations are written back to the host:
 
-## How to Run
+```bash
+docker run --rm \
+  -v ${PWD}/data:/app/data \
+  -v ${PWD}/outputs:/app/outputs \
+  scd
+```
 
-1. Prepare dataset in the correct folder structure
-2. Run training:
+Results appear in `outputs/predictions/`. To train inside the container:
 
-python src/training/train.py
+```bash
+docker run --rm \
+  -v ${PWD}/data:/app/data \
+  -v ${PWD}/outputs:/app/outputs \
+  scd python src/training/train.py --model siamese_unet
+```
 
-3. Best model will be saved in:
+(On Windows PowerShell `${PWD}` works as shown; on cmd.exe use `%cd%`.)
 
-outputs/checkpoints/
+## Tests
 
+The test suite uses `pytest`:
+
+```bash
+pytest
+```
+
+- Model tests check that each architecture produces a correctly shaped
+  change mask — these run without the dataset.
+- Dataset / DataLoader tests verify preprocessing, tensor shapes and
+  batching; they are **skipped automatically** when the dataset is not
+  present (e.g. in a fresh checkout).
+
+`tests/first/` contains the early exploratory scripts used to inspect the
+dataset; they are kept for reference and are not part of the pytest suite.
+
+## Setup
+
+Requires Python 3.9+.
+
+```bash
+pip install -r requirements.txt
+```
+
+Then place the dataset under `data/raw/building-change/` as shown above and
+follow the [Training](#training) or [Inference](#inference-and-change-visualization)
+sections — or use [Docker](#docker).
+
+## Possible Improvements
+
+- Train `SiameseUNet` for more epochs with early stopping on validation loss.
+- Add data augmentation (flips, rotations) to reduce overfitting.
+- Report IoU / F1 over the full validation set, not only sample pairs.
+- Train on a GPU for faster experimentation.

@@ -1,14 +1,20 @@
-import sys
-sys.path.append(r"c:\Users\Abra\scene-change-detection")
+"""Shape test for the Siamese change detection model.
 
+The shared encoder processes A and B with the same weights; this test
+confirms the difference-and-decode path yields a single-channel mask at
+the input resolution.
+"""
 import torch
+
 from src.models.siamese_model import SiameseChangeNet
 
-model = SiameseChangeNet()
 
-image_a = torch.randn(4, 3, 512, 512)
-image_b = torch.randn(4, 3, 512, 512)
+def test_siamese_model_output_shape():
+    model = SiameseChangeNet()
 
-output = model(image_a, image_b)
+    image_a = torch.randn(2, 3, 256, 256)
+    image_b = torch.randn(2, 3, 256, 256)
 
-print("Output shape:", output.shape)
+    output = model(image_a, image_b)
+
+    assert output.shape == (2, 1, 256, 256)
